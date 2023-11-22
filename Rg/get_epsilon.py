@@ -4,14 +4,13 @@ Phi-Psi information: Nframes * Nangles * 2
 E-Prop information: Nframes * 2 (E in the first column and Prop in the second)
 """
 
-import sys
-
 import numpy as np
 import tqdm
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import matplotlib.pyplot as plt
+
+from model import DeepReweighting, EarlyStopping, loss
+
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -23,7 +22,10 @@ parser.add_argument('--target', '-t', type=float, required=True)
 
 parser.add_argument('--output', '-o', type=str, default='./epsilon.dat')
 parser.add_argument('--steps', '-s', type=int, default=1000)
-parser.add_argument('--learning_rate', '-l', type=float, default=1e-3)
+parser.add_argument('--learning_rate', '-l', type=float, default=5e-3)
+parser.add_argument('--verbose', '-v', action='store_true', default=False)
+parser.add_argument('--schedule', action='store_true', default=False)
+parser.add_argument('--early_stop', action='store_true', default=False)
 parser.add_argument('--device', type=str, default='cpu')  # Currently not support CUDA
 args, _ = parser.parse_known_args()
 
@@ -37,7 +39,7 @@ def main():
     lj, rg = get_data(args.input)
     lj = torch.Tensor(lj).to(args.device)
     rg = torch.Tensor(rg).to(args.device)
-	
+
     # Extract target property from simulation
     epsilon_old = args.epsilon * 1000  # Prevent loss of float accuracy
     Exp_prop = args.target
@@ -45,87 +47,76 @@ def main():
     # Start training
     print('Start training...')
     model = DeepReweighting(initial_parameter=epsilon_old).to(args.device)
+    optimizer = torch.optim.Adam([model.update], args.learning_rate)
+
+    schedule = False
+    early_stop = False
+    min_lr = 1e-8
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, patience=20,
+                                                           factor=0.6, verbose=True,
+                                                           threshold=1e-2, min_lr=min_lr, cooldown=5)
+    early_stopping = EarlyStopping(patience=200)
 
     epsilon_record = []
     prediction_record = []
-    step_record = np.arange(0, args.steps, 1)
+    step_record = []
 
     for steps in tqdm.tqdm(range(args.steps)):
-        loss_local, epsilon_update, Prop_pred = one_iter(model, lj_sim=lj, Prop_sim=rg, Prop_exp=Exp_prop, epsilon_old=epsilon_old)
+
+        model.train()
+
+        delta_E = model(lj, epsilon_old)
+
+        loss_calculate = loss(delta_E, rg, Exp_prop)
+        losses, Prop_pred = loss_calculate
+
+        optimizer.zero_grad()
+        losses.backward()
+        optimizer.step()
 
         # Getting training record
-        #print(f'##### STEP {steps} #####')
-        #for name, param in model.named_parameters():
-        #    if param.grad is not None:
-        #        print(f"Gradient Norm: {param.grad.norm().item()}")
+        if args.verbose:
+            print(f'##### STEP {steps} #####')
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    print(f"Gradient Norm: {param.grad.norm().item()}")
 
-        #print(f'Step {steps}: loss {loss_local}\n')
+            print(f'Step {steps}: loss {losses}\n')
 
-        epsilon_record.append(epsilon_update.detach().numpy() / 1000)
+        # Check training state
+        if args.schedule:
+            scheduler.step(losses)
+            if optimizer.param_groups[0]['lr'] <= min_lr * 1.5:
+                print('converged')
+                break
+
+        if args.early_stop:
+            early_stopping(losses)
+            if early_stopping.early_stop:
+                break
+
+        # check NaN
+        if torch.isnan(model.update):
+            print("NaN encoutered, exiting...")
+            break
+
+        step_record.append(steps + 1)
+        epsilon_record.append(model.update.detach().numpy() / 1000)
         prediction_record.append(Prop_pred.detach().numpy())
 
-    ploting(step_record, epsilon=epsilon_record, rg=prediction_record)
-    print('final epsilon: %.8f' % epsilon_record[-1])
+    # Save re-weighting results
+    if args.output.endswith('.csv'):
+        output_file = args.output
+    else:
+        suffix = args.output.split('.')[-1]
+        output_file = args.output.replace(suffix, 'csv')
 
+    with open(output_file, 'w') as f:
+        f.write('steps,epsilon,rg\n')
+        for i in range(len(step_record)):
+            f.write('%d,%.6f,%.2f\n' % (step_record[i], epsilon_record[i], prediction_record[i]))
 
-def loss(delta_E, Prop_sim, Prop_exp):
-    """
-    IMPORTANT: Here the loss should be pre-defined before reweighting
-
-    :param delta_E: Delta energy of each conformation from simulation
-    :param Prop_sim: Target property of conformations in simulation
-    :param Prop_exp: Expected property of the system
-    :return: loss value
-    """
-    # Reweighting
-    weights = torch.exp(- delta_E * invkT)
-
-    # Predict Reweighted property vector
-    weighted_Prop_sum = torch.mul(Prop_sim, weights)
-    Prop_pred = torch.sum(weighted_Prop_sum, dim=0) / torch.sum(weights)
-
-    # Calculate loss
-    _loss = torch.abs(Prop_exp - Prop_pred) / Prop_exp
-
-    return _loss, Prop_pred
-
-
-class DeepReweighting(nn.Module):
-
-    def __init__(self, initial_parameter):
-        super(DeepReweighting, self).__init__()
-
-        self.update = nn.Parameter(torch.Tensor([initial_parameter]), requires_grad=True)
-        self.optimizer = optim.Adam([self.update], args.learning_rate)
-
-    def forward(self, lj, epsilon_old, **kwargs):
-        """
-        :param lj: lj potential for each conformation
-        :param epsilon_old: initial epsilon value
-        :return: delta energy for each conformation
-        """
-        
-        delta_E = lj * torch.sqrt(self.update / epsilon_old) - lj
-        return delta_E
-
-    def fit(self, delta_E, Prop_sim, Prop_exp):
-        loss_calculate = loss(delta_E, Prop_sim, Prop_exp)
-        self.loss = loss_calculate[0]
-
-        self.optimizer.zero_grad()
-        self.loss.backward()
-        self.optimizer.step()
-
-        return loss_calculate[1]
-
-
-def one_iter(model, lj_sim, Prop_sim, Prop_exp, epsilon_old):
-    model.train()
-
-    delta_E = model(lj_sim, epsilon_old)
-    Prop_pred = model.fit(delta_E, Prop_sim, Prop_exp)
-
-    return model.loss, model.update, Prop_pred
+    print('final epsilon: %.6f' % epsilon_record[-1])
 
 
 def get_data(file_name):
@@ -143,57 +134,12 @@ def get_data(file_name):
     return E_LJ_np, rg_np
 
 
-def ploting(steps, epsilon, rg):
-    font_title = {"family": 'Times New Roman',
-                  "style": 'italic',
-                  "weight": "bold",
-                  "color": "black",
-                  "size": 24}
-    font_label = {"family": 'Times New Roman',
-                  # "style":'italic',
-                  "weight": "bold",
-                  "color": "black",
-                  "size": 18}
-    font_legend = {"family": 'Times New Roman',
-                   # "style":'italic',
-                   "weight": "bold",
-                   # "color":"black",
-                   "size": 16}
-    fig = plt.figure(figsize=[20, 5.5])
-    ax = fig.add_subplot(111)
-    ax.plot(steps, epsilon, "blue", linewidth=3, label='Epsilon')
-    ax2 = ax.twinx()
-    ax2.plot(steps, rg, 'green', linewidth=3, label="Target")
-    ax.legend(loc="center right", prop=font_legend, bbox_to_anchor=(1.003, 0.61))
-    ax2.legend(loc="center right", prop=font_legend, bbox_to_anchor=(0.995, 0.5))
-    ax.grid(False)
-    ax.set_xlabel("Steps", font_label)
-    ax.set_ylabel("Epsilon (Kcal/mol)", font_label)
-    ax2.set_ylabel("Target Function", font_label)
-    # plt.tick_params(labelsize=16)
-    labels = ax.get_xticklabels() + ax.get_yticklabels() + ax2.get_yticklabels()
-    [label.set_fontname("Times New Roman") for label in labels]
-    [label.set_fontweight("bold") for label in labels]
-    [label.set_fontsize(16) for label in labels]
-    ax.spines["bottom"].set_linewidth(2)
-    ax.spines["top"].set_linewidth(2)
-    ax.spines["right"].set_linewidth(2)
-    ax.spines["left"].set_linewidth(2)
-
-    import os
-    dir_name = os.getcwd()
-    dir_name = dir_name.split("\\")[-1]
-    plt.title(dir_name, fontdict=font_title)
-    # plt.plot(x,z)
-    # plt.show()
-    plt.savefig("reweighting_result.png", dpi=600)
-
-
 def check_rationality(rg_list, target):
-    if target < torch.max(rg_list) and target > torch.min(rg_list):
+    if torch.max(rg_list) > target > torch.min(rg_list):
         print(torch.max(rg_list), torch.min(rg_list))
     else:
         raise ValueError('target not rational')
+
 
 if __name__ == '__main__':
     main()
