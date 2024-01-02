@@ -19,7 +19,7 @@ parser.add_argument('--input', '-i', type=str, default='./LJ_rg.dat')
 
 # initial epsilon and target rg (required in float type)
 parser.add_argument('--epsilon', '-e', type=float, required=True)
-parser.add_argument('--target', '-t', type=float, required=True)
+parser.add_argument('--target', '-t', type=float, default=0.0)
 
 parser.add_argument('--output', '-o', type=str, default='./result.csv')
 parser.add_argument('--steps', '-s', type=int, default=1000)
@@ -31,7 +31,7 @@ parser.add_argument('--early_stop', action='store_true', default=False)
 parser.add_argument('--device', type=str, default='cpu')  # Currently not support CUDA
 
 parser.add_argument('--acc', type=float, default=1000)
-
+parser.add_argument('--test', type=float, default=1.0)
 args, _ = parser.parse_known_args()
 
 # Constants that may be required
@@ -41,17 +41,19 @@ RT = 8.314 * 300
 
 def main():
     # Extract phi-psi values from trajectory
-    lj, rg = get_data(args.input)
-    lj = torch.Tensor(lj).to(args.device)
-    rg = torch.Tensor(rg).to(args.device)
+    alpha, zeta, cross = get_data(args.input)
+    cross = torch.Tensor(cross).to(args.device)
 
-    # Extract target property from simulation
-    epsilon_old = args.epsilon * args.acc  # Prevent loss of float accuracy
-    Exp_prop = args.target
+    ramachandran = []
+    for i in range(len(alpha)):
+        ramachandran.append(np.histogram2d(zeta[i], alpha[i],
+                                           bins=(24, 24),
+                                           range=[[-180, 180], [-180, 180]])[0])
+    ramachandran = torch.Tensor(np.array(ramachandran)).to(args.device)
 
     # Start training
     print('Start training...')
-    model = DeepReweighting(initial_parameter=epsilon_old).to(args.device)
+    model = DeepReweighting(initial_parameter=torch.zeros((1, 1, 24, 24))).to(args.device)
     optimizer = get_optimizer(args.optimizer, model, args.learning_rate)
 
     min_lr = 1e-8
@@ -60,7 +62,7 @@ def main():
                                                            threshold=1e-2, min_lr=min_lr, cooldown=5)
     early_stopping = EarlyStopping(patience=5)
 
-    epsilon_record = []
+    cmap_record = []
     prediction_record = []
     step_record = []
 
@@ -69,9 +71,9 @@ def main():
 
         model.train()
 
-        delta_E = model(lj, epsilon_old)
+        delta_E = model(ramachandran)
 
-        loss_calculate = loss(delta_E, rg, Exp_prop)
+        loss_calculate = loss(delta_E, cross, args.target)
         losses, Prop_pred = loss_calculate
 
         optimizer.zero_grad()
@@ -101,13 +103,11 @@ def main():
 
         # check NaN
         if torch.isnan(model.update) or torch.isnan(Prop_pred):
-            # model.update = (epsilon_record[-1] + 2e-6) * args.acc
-            # optimizer = torch.optim.Adam([model.update], args.learning_rate)
             print("NaN encoutered, exiting...")
             break
 
         step_record.append(steps + 1)
-        epsilon_record.append(model.update.detach().numpy() / args.acc)
+        cmap_record.append(model.update.detach().numpy())
         prediction_record.append(Prop_pred.detach().numpy())
 
     print(time.time() - time0)
@@ -120,32 +120,36 @@ def main():
 
     with open(output_file, 'w') as f:
         f.write('steps,epsilon,rg\n')
-        for i in range(len(step_record)):
-            f.write('%d,%.6f,%.6f\n' % (step_record[i], epsilon_record[i], prediction_record[i]))
+        for i in range(0, len(step_record), 100):
+            f.write('%d,%.6f,%.2f\n' % (step_record[i],
+                                        cmap_record[i],
+                                        prediction_record[i]))
 
-    print('final epsilon: %.6f, final rg: %.2f' % (epsilon_record[-1], prediction_record[-1]))
+    print('final cross account: %.2f' % (prediction_record[-1]))
 
 
 def get_data(file_name):
-    E_LJ = []
-    rg = []
-    file = open(file_name, "r")
-    file.readline()
-    for line in file.readlines():
-        data = line.split()
-        E_LJ.append(float(data[1]))
-        rg.append(float(data[2]))
-    file.close()
-    E_LJ_np = np.array(E_LJ)
-    rg_np = np.array(rg)
-    return E_LJ_np, rg_np
+    """
+    :param file_name:
+    :return:
+    """
+    filenames = ['%s_right_all.dat' % file_name, '%s_wrong_all.dat' % file_name]
 
+    alpha = []
+    zeta = []
+    cross = []
 
-def check_rationality(rg_list, target):
-    if torch.max(rg_list) > target > torch.min(rg_list):
-        print(torch.max(rg_list), torch.min(rg_list))
-    else:
-        raise ValueError('target not rational')
+    for filename in filenames:
+        with open(filename, 'r') as f:
+            for lines in f.readlines():
+                if lines[0] != '#':
+                    data = lines.split()
+
+                    zeta.append([float(data[4]), float(data[10]), float(data[16])])
+                    alpha.append([float(data[5]), float(data[11]), float(data[17])])
+                    cross.append(filenames.index(filename))
+
+    return alpha, zeta, cross
 
 
 def loss(delta_E, Prop_sim, Prop_exp):
@@ -161,11 +165,11 @@ def loss(delta_E, Prop_sim, Prop_exp):
     weights = torch.exp(- delta_E * invkT)
 
     # Predict Reweighted property vector
-    weighted_Prop_sum = torch.mul(Prop_sim, weights)
+    weighted_Prop_sum = Prop_sim * weights[:, None, None]
     Prop_pred = torch.sum(weighted_Prop_sum, dim=0) / torch.sum(weights)
 
     # Calculate loss
-    _loss = torch.abs(Prop_exp - Prop_pred) / Prop_exp
+    _loss = torch.abs(Prop_exp - Prop_pred) / weights.shape[0]
 
     return _loss, Prop_pred
 
@@ -175,17 +179,17 @@ class DeepReweighting(nn.Module):
     def __init__(self, initial_parameter):
         super(DeepReweighting, self).__init__()
 
-        self.update = nn.Parameter(torch.Tensor([initial_parameter]), requires_grad=True)
+        self.update = nn.Parameter(initial_parameter, requires_grad=True)
 
-    def forward(self, lj, epsilon_old, **kwargs):
+    def forward(self, ramachandran):
         """
-        :param lj: lj potential for each conformation
-        :param epsilon_old: initial epsilon value
-        :return: delta energy for each conformation
+        :param ramachandran: The phi-psi distribution calculated on (24 x 24) grid
+        :return: Energy added from CMAP for each conformation
         """
 
-        delta_E = lj * torch.sqrt(self.update / epsilon_old) - lj
-        return delta_E
+        # The input should be of shape [Batch * 24 * 24]
+        output = ramachandran * self.update
+        return torch.sum(output.squeeze(0), dim=(-2, -1))
 
 
 class EarlyStopping:
