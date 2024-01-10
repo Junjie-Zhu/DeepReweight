@@ -15,10 +15,9 @@ import matplotlib.pyplot as plt
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--input', '-i', type=str, default='./LJ_rg.dat')
+parser.add_argument('--input', '-i', type=str, default='./dih_AAAA')
 
-# initial epsilon and target rg (required in float type)
-parser.add_argument('--epsilon', '-e', type=float, required=True)
+# target (required in float type)
 parser.add_argument('--target', '-t', type=float, default=0.0)
 
 parser.add_argument('--output', '-o', type=str, default='./result.csv')
@@ -31,7 +30,6 @@ parser.add_argument('--early_stop', action='store_true', default=False)
 parser.add_argument('--device', type=str, default='cpu')  # Currently not support CUDA
 
 parser.add_argument('--acc', type=float, default=1000)
-parser.add_argument('--test', type=float, default=1.0)
 args, _ = parser.parse_known_args()
 
 # Constants that may be required
@@ -81,11 +79,11 @@ def main():
         optimizer.step()
 
         # Getting training record
-        if args.verbose:
+        if args.verbose and (steps % 10 == 0):
             print(f'##### STEP {steps} #####')
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    print(f"Gradient Norm: {param.grad.norm().item()}")
+            # for name, param in model.named_parameters():
+            #     if param.grad is not None:
+            #         print(f"Gradient Norm: {param.grad.norm().item()}")
 
             print(f'Step {steps}: loss {losses}\n')
 
@@ -102,7 +100,7 @@ def main():
                 break
 
         # check NaN
-        if torch.isnan(model.update) or torch.isnan(Prop_pred):
+        if torch.isnan(model.update).any().item() or torch.isnan(Prop_pred):
             print("NaN encoutered, exiting...")
             break
 
@@ -118,12 +116,14 @@ def main():
         suffix = args.output.split('.')[-1]
         output_file = args.output.replace(suffix, 'csv')
 
+    '''
     with open(output_file, 'w') as f:
-        f.write('steps,epsilon,rg\n')
+        f.write('steps,cmap,rg\n')
         for i in range(0, len(step_record), 100):
             f.write('%d,%.6f,%.2f\n' % (step_record[i],
                                         cmap_record[i],
                                         prediction_record[i]))
+    '''
 
     print('final cross account: %.2f' % (prediction_record[-1]))
 
@@ -163,14 +163,14 @@ def loss(delta_E, Prop_sim, Prop_exp):
     """
     # Reweighting
     weights = torch.exp(- delta_E * invkT)
-
+    
     # Predict Reweighted property vector
-    weighted_Prop_sum = Prop_sim * weights[:, None, None]
+    weighted_Prop_sum = torch.mul(Prop_sim, weights)
     Prop_pred = torch.sum(weighted_Prop_sum, dim=0) / torch.sum(weights)
 
     # Calculate loss
     _loss = torch.abs(Prop_exp - Prop_pred) / weights.shape[0]
-
+    
     return _loss, Prop_pred
 
 
