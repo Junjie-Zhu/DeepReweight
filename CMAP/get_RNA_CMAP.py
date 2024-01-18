@@ -20,7 +20,7 @@ parser.add_argument('--input', '-i', type=str, default='./dih_AAAA')
 # target (required in float type)
 parser.add_argument('--target', '-t', type=float, default=0.0)
 
-parser.add_argument('--output', '-o', type=str, default='./result.csv')
+parser.add_argument('--output', '-o', type=str, default='./result.dat')
 parser.add_argument('--steps', '-s', type=int, default=1000)
 parser.add_argument('--optimizer', '-opt', type=str, default='adam')
 parser.add_argument('--learning_rate', '-l', type=float, default=5e-3)
@@ -105,16 +105,19 @@ def main():
             break
 
         step_record.append(steps + 1)
-        cmap_record.append(model.update.detach().numpy())
-        prediction_record.append(Prop_pred.detach().numpy())
+        cmap_record.append(model.update.detach().squeeze().numpy())
+        prediction_record.append(Prop_pred.detach().squeeze().numpy())
 
-    print(time.time() - time0)
+    print('Optimization complete, taking time: %.3f s' % (time.time() - time0))
     # Save re-weighting results
-    if args.output.endswith('.csv'):
+    if args.output.endswith('.dat'):
         output_file = args.output
     else:
         suffix = args.output.split('.')[-1]
-        output_file = args.output.replace(suffix, 'csv')
+        output_file = args.output.replace(suffix, 'dat')
+
+    np.savetxt(output_file, cmap_record[-1],)
+    np.savetxt(output_file.replace('dat', 'record.dat'), np.array([step_record, prediction_record]).T)
 
     '''
     with open(output_file, 'w') as f:
