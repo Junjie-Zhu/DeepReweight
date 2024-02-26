@@ -29,7 +29,7 @@ parser.add_argument('--schedule', action='store_true', default=False)
 parser.add_argument('--early_stop', action='store_true', default=False)
 parser.add_argument('--device', type=str, default='cpu')  # Currently not support CUDA
 
-parser.add_argument('--acc', type=float, default=1000)
+parser.add_argument('--weight', type=float, default=1e-2)
 args, _ = parser.parse_known_args()
 
 # Constants that may be required
@@ -69,10 +69,13 @@ def main():
 
         model.train()
 
-        delta_E = model(ramachandran)
+        delta_E, CMAP = model(ramachandran)
 
         loss_calculate = loss(delta_E, cross, args.target)
         losses, Prop_pred = loss_calculate
+
+        # Regularization
+        losses += regulization(CMAP, weight=args.weight)
 
         optimizer.zero_grad()
         losses.backward()
@@ -172,9 +175,25 @@ def loss(delta_E, Prop_sim, Prop_exp):
     Prop_pred = torch.sum(weighted_Prop_sum, dim=0) / torch.sum(weights)
 
     # Calculate loss
-    _loss = torch.abs(Prop_exp - Prop_pred) / weights.shape[0]
+    _loss = torch.abs(Prop_pred - Prop_exp)
     
     return _loss, Prop_pred
+
+
+def regulization(parameter, weight=1e-2):
+    """
+    :param weight: loss weight
+    :param parameter: The parameter to be regularized
+    :return: The regularization loss
+    """
+
+    # calculate mse on parameter and zero
+    parameter = parameter.view(-1) + 1e-12  # avoid zero
+
+    mse = torch.nn.MSELoss()
+    loss = mse(parameter, torch.zeros_like(parameter))
+
+    return weight * torch.sqrt(loss)
 
 
 class DeepReweighting(nn.Module):
@@ -192,7 +211,8 @@ class DeepReweighting(nn.Module):
 
         # The input should be of shape [Batch * 24 * 24]
         output = ramachandran * self.update
-        return torch.sum(output.squeeze(0), dim=(-2, -1))
+        update_copy = self.update * 1.0
+        return torch.sum(output.squeeze(0), dim=(-2, -1)), update_copy
 
 
 class EarlyStopping:
