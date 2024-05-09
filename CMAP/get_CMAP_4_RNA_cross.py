@@ -3,33 +3,26 @@ Running this script for reweighting requires two input files:
 Phi-Psi information: Nframes * Nangles * 2
 E-Prop information: Nframes * 2 (E in the first column and Prop in the second)
 """
-
+import os.path
 import time
 import numpy as np
 import tqdm
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import matplotlib.pyplot as plt
 
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--input', '-i', type=str, default='./dih_AAAA')
+parser.add_argument('--input', '-i', type=str, required=True)
+parser.add_argument('--target', '-t', type=float, required=True)
+parser.add_argument('--output', '-o', type=str, required=True)
 
-# target (required in float type)
-parser.add_argument('--target', '-t', type=float, default=0.0)
-
-parser.add_argument('--output', '-o', type=str, default='./result.dat')
+parser.add_argument('--weight', '-w', type=float, default=1e-2)
 parser.add_argument('--steps', '-s', type=int, default=1000)
 parser.add_argument('--optimizer', '-opt', type=str, default='adam')
-parser.add_argument('--learning_rate', '-l', type=float, default=5e-3)
-parser.add_argument('--verbose', '-v', action='store_true', default=False)
-parser.add_argument('--schedule', action='store_true', default=False)
-parser.add_argument('--early_stop', action='store_true', default=False)
+parser.add_argument('--learning_rate', '-lr', type=float, default=5e-3)
 parser.add_argument('--device', type=str, default='cpu')  # Currently not support CUDA
 
-parser.add_argument('--weight', type=float, default=1e-2)
 args, _ = parser.parse_known_args()
 
 # Constants that may be required
@@ -54,12 +47,6 @@ def main():
     model = DeepReweighting(initial_parameter=torch.zeros((1, 1, 24, 24))).to(args.device)
     optimizer = get_optimizer(args.optimizer, model, args.learning_rate)
 
-    min_lr = 1e-8
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer, patience=20,
-                                                           factor=0.6, verbose=True,
-                                                           threshold=1e-2, min_lr=min_lr, cooldown=5)
-    early_stopping = EarlyStopping(patience=5)
-
     cmap_record = []
     prediction_record = []
     step_record = []
@@ -81,55 +68,26 @@ def main():
         losses.backward()
         optimizer.step()
 
-        # Getting training record
-        if args.verbose and (steps % 10 == 0):
-            print(f'##### STEP {steps} #####')
-            # for name, param in model.named_parameters():
-            #     if param.grad is not None:
-            #         print(f"Gradient Norm: {param.grad.norm().item()}")
-
-            print(f'Step {steps}: loss {losses}\n')
-
-        # Check training state
-        if args.schedule:
-            scheduler.step(losses)
-            if optimizer.param_groups[0]['lr'] <= min_lr * 1.5:
-                print('converged')
-                break
-
-        if args.early_stop:
-            early_stopping(losses)
-            if early_stopping.early_stop:
-                break
-
         # check NaN
         if torch.isnan(model.update).any().item() or torch.isnan(Prop_pred):
             print("NaN encoutered, exiting...")
             break
 
         step_record.append(steps + 1)
-        cmap_record.append(model.update.detach().squeeze().numpy())
-        prediction_record.append(Prop_pred.detach().squeeze().numpy())
+        cmap_record.append(model.update.detach().squeeze().cpu().numpy())
+        prediction_record.append(Prop_pred.detach().squeeze().cpu().numpy())
 
     print('Optimization complete, taking time: %.3f s' % (time.time() - time0))
+
     # Save re-weighting results
-    if args.output.endswith('.dat'):
-        output_file = args.output
-    else:
-        suffix = args.output.split('.')[-1]
-        output_file = args.output.replace(suffix, 'dat')
+    output_path = args.output
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+
+    output_file = os.path.join(output_path, f'{args.input}.cmap.dat')
 
     np.savetxt(output_file, cmap_record[-1],)
-    np.savetxt(output_file.replace('dat', 'record.dat'), np.array([step_record, prediction_record]).T)
-
-    '''
-    with open(output_file, 'w') as f:
-        f.write('steps,cmap,rg\n')
-        for i in range(0, len(step_record), 100):
-            f.write('%d,%.6f,%.2f\n' % (step_record[i],
-                                        cmap_record[i],
-                                        prediction_record[i]))
-    '''
+    np.savetxt(output_file.replace('cmap', 'record'), np.array([step_record, prediction_record]).T)
 
     print('final cross account: %.2f' % (prediction_record[-1]))
 
