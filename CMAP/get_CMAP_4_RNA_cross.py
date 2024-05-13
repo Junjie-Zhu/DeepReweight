@@ -93,10 +93,7 @@ def main():
 
 
 def get_data(file_name):
-    """
-    :param file_name:
-    :return:
-    """
+
     filenames = ['%s_right_all.dat' % file_name, '%s_wrong_all.dat' % file_name]
 
     alpha = []
